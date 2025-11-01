@@ -1,0 +1,311 @@
+#!pip install transformers timm datasets torchvision
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms as transforms
+from PIL import Image
+import os
+import timm
+import json
+import numpy as np
+import cv2
+from sklearn.model_selection import train_test_split
+
+from transformers import SegformerForSemanticSegmentation
+from google.colab import drive
+drive.mount("/content/drive")
+
+print("CUDA available:", torch.cuda.is_available())
+print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")
+
+BASE_PATH = '/content/drive/My Drive/Aligned_Sheets1/'
+JSON_PATH = os.path.join(BASE_PATH, 'dataset_updated.json')
+MASKS_PATH = os.path.join(BASE_PATH, 'segmentation_masks')
+MODEL_PATH = os.path.join(BASE_PATH, "segformer_best_model_512.pth")
+
+BATCH_SIZE = 8
+TARGET_SIZE = (512,512)
+EPOCHS = 10
+
+class SegmentationDataset(Dataset):
+    def __init__(self, image_paths, mask_paths, transform=None, target_size=(512,512)):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.transform = transform
+        self.target_size = target_size
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.image_paths[idx]).convert("RGB").resize(self.target_size)
+        mask_np = np.load(self.mask_paths[idx])
+        mask_resized = cv2.resize(mask_np, self.target_size, interpolation=cv2.INTER_NEAREST)
+        mask = torch.tensor(mask_resized).unsqueeze(0).float()
+        mask = (mask > 0.5).float()
+
+
+        if self.transform:
+            image = self.transform(image)
+
+        mask = mask.float()
+
+        return image, mask
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+])
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = SegformerForSemanticSegmentation.from_pretrained(
+    "nvidia/segformer-b0-finetuned-ade-512-512",
+    num_labels=1,
+    ignore_mismatched_sizes=True
+).to(device)
+
+criterion = nn.BCEWithLogitsLoss()
+
+def dice_coefficient(y_true, y_pred, smooth=1e-6):
+    y_pred = (torch.sigmoid(y_pred) > 0.5).float()
+    y_true = y_true.float()
+    if y_true.dim() == 4 and y_true.shape[1] == 1:
+        y_true = y_true.squeeze(1)
+    if y_pred.dim() == 4 and y_pred.shape[1] == 1:
+        y_pred = y_pred.squeeze(1)
+
+    dims = tuple(range(1, y_true.dim()))
+    intersection = (y_true * y_pred).sum(dim=dims)
+    union = y_true.sum(dim=dims) + y_pred.sum(dim=dims)
+    dice = (2. * intersection + smooth) / (union + smooth)
+    return dice.mean()
+
+def precision_metric(y_true, y_pred, smooth=1e-6):
+    y_pred = (torch.sigmoid(y_pred) > 0.5).float()
+    if y_true.dim() == 4 and y_true.shape[1] == 1:
+        y_true = y_true.squeeze(1)
+    if y_pred.dim() == 4 and y_pred.shape[1] == 1:
+        y_pred = y_pred.squeeze(1)
+
+    dims = tuple(range(1, y_true.dim()))
+    true_positive = (y_pred * y_true).sum(dim=dims)
+    predicted_positive = y_pred.sum(dim=dims)
+    precision = (true_positive + smooth) / (predicted_positive + smooth)
+    return precision.mean()
+
+def recall_metric(y_true, y_pred, smooth=1e-6):
+    y_pred = (torch.sigmoid(y_pred) > 0.5).float()
+    if y_true.dim() == 4 and y_true.shape[1] == 1:
+        y_true = y_true.squeeze(1)
+    if y_pred.dim() == 4 and y_pred.shape[1] == 1:
+        y_pred = y_pred.squeeze(1)
+
+    dims = tuple(range(1, y_true.dim()))
+    true_positive = (y_pred * y_true).sum(dim=dims)
+    actual_positive = y_true.sum(dim=dims)
+    recall = (true_positive + smooth) / (actual_positive + smooth)
+    return recall.mean()
+
+def iou_score(y_true, y_pred, smooth=1e-6):
+    y_pred = (torch.sigmoid(y_pred) > 0.5).float()
+    if y_true.dim() == 4 and y_true.shape[1] == 1:
+        y_true = y_true.squeeze(1)
+    if y_pred.dim() == 4 and y_pred.shape[1] == 1:
+        y_pred = y_pred.squeeze(1)
+
+    dims = tuple(range(1, y_true.dim()))
+    intersection = (y_pred * y_true).sum(dim=dims)
+    union = y_pred.sum(dim=dims) + y_true.sum(dim=dims) - intersection
+    iou = (intersection + smooth) / (union + smooth)
+    return iou.mean()
+
+def accuracy_metric(y_true, y_pred, threshold=0.5):
+    y_pred = (torch.sigmoid(y_pred) > threshold).float()
+    y_true = y_true.float()
+
+    if y_true.dim() == 4 and y_true.shape[1] == 1:
+        y_true = y_true.squeeze(1)
+    if y_pred.dim() == 4 and y_pred.shape[1] == 1:
+        y_pred = y_pred.squeeze(1)
+
+    correct = (y_pred == y_true).float()
+    return correct.mean()
+
+def get_bbox_from_mask(mask, threshold=0.5):
+    binary_mask = (mask > threshold).astype(np.uint8)
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bboxes = []
+    for contour in contours:
+        if cv2.contourArea(contour) > 100:
+            x, y, w, h = cv2.boundingRect(contour)
+            bboxes.append([x, y, x+w, y+h])
+    return bboxes
+
+with open(JSON_PATH, 'r') as f:
+    data = json.load(f)
+
+image_paths = []
+mask_paths = []
+
+for item in data:
+    try:
+        img_path = os.path.join(BASE_PATH, item['path'])
+        if not os.path.exists(img_path):
+            continue
+
+        folder_num = int(item['path'].split('/')[0])
+        mask_filename = os.path.splitext(os.path.basename(item['path']))[0] + "_mask.npy"
+        mask_path = os.path.join(MASKS_PATH, f"folder_{folder_num:03d}", mask_filename)
+
+        if os.path.exists(mask_path):
+            image_paths.append(img_path)
+            mask_paths.append(mask_path)
+    except Exception as e:
+        print(f"Skipping invalid entry: {e}")
+
+train_imgs, val_imgs, train_masks, val_masks = train_test_split(
+   image_paths, mask_paths, test_size=0.2, random_state=42
+)
+
+train_dataset = SegmentationDataset(train_imgs, train_masks, transform=transform, target_size=TARGET_SIZE)
+val_dataset = SegmentationDataset(val_imgs, val_masks, transform=transform, target_size=TARGET_SIZE)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=2)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+print(f"Training samples: {len(train_imgs)}")
+print(f"Validation samples: {len(val_imgs)}")
+
+def train_validate(model, train_loader, val_loader, epochs, criterion, optimizer, device):
+    import time
+    best_iou = 0
+    patience = 0
+    max_patience = 10
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, verbose=True)
+
+    train_log = {
+    "loss": [], "accuracy": [], "iou": [], "dice": [], "precision": [], "recall": [],
+    "val_loss": [], "val_accuracy": [], "val_iou": [], "val_dice": [], "val_precision": [], "val_recall": []
+}
+
+    print("Training started...")
+
+    for epoch in range(epochs):
+        print(f"\nEpoch {epoch+1}/{epochs} starting...")
+        start_time = time.time()
+
+        model.train()
+        total_loss, total_dice, total_iou, total_precision, total_recall, total_accuracy = 0, 0, 0, 0, 0, 0
+
+        for batch_idx, (images, masks) in enumerate(train_loader):
+            images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+            outputs = model(pixel_values=images).logits
+
+            outputs = torch.nn.functional.interpolate(
+                outputs,
+                size=masks.shape[2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+
+            outputs = outputs.squeeze(1)
+            loss = criterion(outputs, masks.squeeze(1))
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_dice += dice_coefficient(masks, outputs).item()
+            total_iou += iou_score(masks, outputs).item()
+            total_precision += precision_metric(masks, outputs).item()
+            total_recall += recall_metric(masks, outputs).item()
+            total_accuracy += accuracy_metric(masks, outputs).item()
+
+        train_loss = total_loss / len(train_loader)
+        train_dice = total_dice / len(train_loader)
+        train_iou = total_iou / len(train_loader)
+        train_precision = total_precision / len(train_loader)
+        train_recall = total_recall / len(train_loader)
+        train_accuracy = total_accuracy / len(train_loader)
+
+        # Validation
+        model.eval()
+        val_iou = 0
+        val_dice = 0
+        val_precision = 0
+        val_recall = 0
+        val_accuracy = 0
+        val_loss = 0
+
+        with torch.no_grad():
+            for images, masks in val_loader:
+                images, masks = images.to(device), masks.to(device)
+                outputs = model(pixel_values=images).logits
+                outputs = torch.nn.functional.interpolate(
+                    outputs,
+                    size=masks.shape[2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+                outputs = outputs.squeeze(1)
+                val_iou += iou_score(masks, outputs).item()
+                val_dice += dice_coefficient(masks, outputs).item()
+                val_precision += precision_metric(masks, outputs).item()
+                val_recall += recall_metric(masks, outputs).item()
+                val_accuracy += accuracy_metric(masks, outputs).item()
+                loss = criterion(outputs, masks.squeeze(1))
+                val_loss += loss.item()
+
+        val_loss /= len(val_loader)
+        val_iou /= len(val_loader)
+        val_dice /= len(val_loader)
+        val_precision /= len(val_loader)
+        val_recall /= len(val_loader)
+        val_accuracy /= len(val_loader)
+
+        scheduler.step(val_iou)
+
+        print(
+          f"Epoch {epoch+1}/{epochs} | "
+          f"Train → Loss: {train_loss:.4f} | Acc: {train_accuracy:.4f} | Dice: {train_dice:.4f} | IoU: {train_iou:.4f} | "
+          f"Precision: {train_precision:.4f} | Recall: {train_recall:.4f} || "
+          f"Val → Loss: {val_loss:.4f} | Acc: {val_accuracy:.4f} | Dice: {val_dice:.4f} | IoU: {val_iou:.4f} | "
+          f"Precision: {val_precision:.4f} | Recall: {val_recall:.4f}"
+)
+
+        print(f"Epoch {epoch+1} completed in {time.time() - start_time:.2f} seconds")
+
+        train_log["loss"].append(train_loss)
+        train_log["dice"].append(train_dice)
+        train_log["iou"].append(train_iou)
+        train_log["precision"].append(train_precision)
+        train_log["recall"].append(train_recall)
+        train_log["val_iou"].append(val_iou)
+        train_log["val_dice"].append(val_dice)
+        train_log["val_precision"].append(val_precision)
+        train_log["val_recall"].append(val_recall)
+        train_log["accuracy"].append(train_accuracy)
+        train_log["val_accuracy"].append(val_accuracy)
+        train_log["val_loss"].append(val_loss)
+
+        # Save best model
+        if val_iou > best_iou:
+            best_iou = val_iou
+            torch.save(model.state_dict(), MODEL_PATH)
+            patience = 0
+            print("Saved new best model")
+        else:
+            patience += 1
+            print(f"Patience: {patience}/{max_patience}")
+            if patience >= max_patience:
+                print("Early stopping")
+                break
+
+    return train_log
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+logs = train_validate(model, train_loader, val_loader, EPOCHS, criterion, optimizer, device)
+
