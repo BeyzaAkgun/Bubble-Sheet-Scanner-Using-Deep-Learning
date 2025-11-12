@@ -321,10 +321,9 @@ logs = train_validate(model, train_loader, val_loader, EPOCHS, criterion, optimi
 import matplotlib.pyplot as plt
 import numpy as np
 
-# ---- 1) X ekseni (epoch sayısı) -----------------------------
-epochs_range = np.arange(1, len(logs["loss"]) + 1)
 
-# ---- 2) Şekil ve ilk subplot - Loss -------------------------
+epochs_range = np.arange(1, len(logs["loss"]) + 1)
+-
 plt.figure(figsize=(16, 5))
 
 plt.subplot(1, 2, 1)
@@ -336,14 +335,13 @@ plt.ylabel("")
 plt.legend()
 plt.grid(alpha=0.3)
 
-# ---- 3) İkinci subplot - IoU --------------------------------
 plt.subplot(1, 2, 2)
 plt.plot(epochs_range, logs["iou"],     label="Train IoU")
 plt.plot(epochs_range, logs["val_iou"], label="Val IoU")
 plt.title(" ")
 plt.xlabel("")
 plt.ylabel("")
-plt.ylim(0, 1)          # IoU 0-1 arasıdır
+plt.ylim(0, 1)          
 plt.legend()
 plt.grid(alpha=0.3)
 
