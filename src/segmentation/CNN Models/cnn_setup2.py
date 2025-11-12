@@ -1,43 +1,47 @@
+# cnn_setup2.py
+# CNN (UNet-like) segmentation training 
+# Place this in a Colab cell and run. Expects splits in BASE_PATH/splits
+
 from google.colab import drive
-drive.mount('/content/drive')
+drive.mount('/content/drive', force_remount=True)
 
 import os
 import json
+import csv
 import numpy as np
 import tensorflow as tf
-import matplotlib.pyplot as plt
 import cv2
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate, Dropout, BatchNormalization
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
-from sklearn.model_selection import train_test_split
 from tensorflow.keras import metrics
 
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except RuntimeError as e:
-        print(e)
+# -----------------------
+# Config (adjust if needed)
+# -----------------------
 
 BASE_PATH = '/content/drive/My Drive/Aligned_Sheets/'
 JSON_PATH = os.path.join(BASE_PATH, 'dataset_updated.json')
 MASKS_PATH = os.path.join(BASE_PATH, 'segmentation_masks')
-MODEL_PATH = os.path.join(BASE_PATH, 'bubble_segmentation_model_halfed.h5')
+SPLIT_DIR = os.path.join(BASE_PATH, 'splits')
+MODEL_PATH = os.path.join(BASE_PATH, 'bubble_segmentation_model_cnn.h5')
+REPORT_CSV = os.path.join(SPLIT_DIR, 'split_report_setup2.csv')
 
 BATCH_SIZE = 2
-TARGET_SIZE = (832, 1176)
+TARGET_SIZE = (832, 1176)   # (H, W)
 EPOCHS = 20
 STEPS_PER_EPOCH = 50
 VALIDATION_STEPS = 20
 
-""":1654 / 2338 ≈ 0.7076
-832 / 1152 = 0.722  ➜ slightly off, but acceptable
+print("BASE_PATH:", BASE_PATH)
+print("JSON_PATH:", JSON_PATH)
+print("MASKS_PATH:", MASKS_PATH)
+print("SPLIT_DIR:", SPLIT_DIR)
 
-"""
-
+# -----------------------
+# Metrics
+# -----------------------
 def iou_metric(y_true, y_pred):
     y_pred = tf.cast(y_pred > 0.5, tf.float32)
     intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2, 3])
@@ -66,6 +70,14 @@ def recall_metric(y_true, y_pred, smooth=1e-6):
     recall = (true_positives + smooth) / (possible_positives + smooth)
     return tf.reduce_mean(recall)
 
+def pixel_accuracy(y_true, y_pred):
+    y_pred = tf.cast(y_pred > 0.5, tf.float32)
+    correct = tf.equal(y_true, y_pred)
+    return tf.reduce_mean(tf.cast(correct, tf.float32))
+
+# -----------------------
+# Data Generator
+# -----------------------
 class DataGenerator(tf.keras.utils.Sequence):
     def __init__(self, image_paths, mask_paths, batch_size=BATCH_SIZE, target_size=TARGET_SIZE, shuffle=True):
         self.image_paths = image_paths
@@ -88,6 +100,8 @@ class DataGenerator(tf.keras.utils.Sequence):
         for i, idx in enumerate(indexes):
             try:
                 img = cv2.imread(self.image_paths[idx])
+                if img is None:
+                    raise ValueError("cv2.imread returned None")
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img = cv2.resize(img, (self.target_size[1], self.target_size[0]))
                 X[i] = img / 255.0
@@ -96,7 +110,7 @@ class DataGenerator(tf.keras.utils.Sequence):
                 mask = cv2.resize(mask, (self.target_size[1], self.target_size[0]), interpolation=cv2.INTER_NEAREST)
                 y[i] = np.expand_dims(mask, axis=-1)
             except Exception as e:
-                print(f"Error loading {self.image_paths[idx]}: {e}")
+                print(f"Error loading {self.image_paths[idx]} or its mask: {e}")
                 X[i] = np.zeros_like(X[i])
                 y[i] = np.zeros_like(y[i])
         return X, y
@@ -105,6 +119,9 @@ class DataGenerator(tf.keras.utils.Sequence):
         if self.shuffle:
             np.random.shuffle(self.indexes)
 
+# -----------------------
+# Model (UNet-like)
+# -----------------------
 def create_unet_model(input_size=(TARGET_SIZE[0], TARGET_SIZE[1], 3)):
     inputs = Input(input_size)
 
@@ -148,63 +165,128 @@ def create_unet_model(input_size=(TARGET_SIZE[0], TARGET_SIZE[1], 3)):
     model = Model(inputs=inputs, outputs=outputs)
     model.compile(optimizer=Adam(learning_rate=1e-4),
                   loss='binary_crossentropy',
-                  metrics=['accuracy', iou_metric, dice_coefficient, metrics.Precision(),metrics.Recall()])
-
+                  metrics=['accuracy', iou_metric, dice_coefficient, metrics.Precision(), metrics.Recall(),pixel_accuracy])
     return model
 
-def get_bbox_from_mask(mask, threshold=0.5):
-    binary_mask = (mask > threshold).astype(np.uint8)
-    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    bboxes = []
-    for contour in contours:
-        if cv2.contourArea(contour) > 100:
-            x, y, w, h = cv2.boundingRect(contour)
-            bboxes.append([x, y, x+w, y+h])
-    return bboxes
+# -----------------------
+# Helpers: build lists from splits
+# -----------------------
+def entry_to_paths(entry):
+    img_path = os.path.join(BASE_PATH, entry['path'])
+    folder_num = int(entry['path'].split('/')[0])
+    mask_filename = os.path.splitext(os.path.basename(entry['path']))[0] + "_mask.npy"
+    mask_path = os.path.join(MASKS_PATH, f"folder_{folder_num:03d}", mask_filename)
+    return img_path, mask_path
 
-with open(JSON_PATH, 'r') as f:
-    data = json.load(f)
+def build_paths_from_entries(entries):
+    imgs, masks, missing = [], [], []
+    for e in entries:
+        img_path, mask_path = entry_to_paths(e)
+        img_exists = os.path.exists(img_path)
+        mask_exists = os.path.exists(mask_path)
+        if img_exists and mask_exists:
+            imgs.append(img_path)
+            masks.append(mask_path)
+        else:
+            missing.append({'path': e.get('path'), 'img_exists': img_exists, 'mask_exists': mask_exists})
+    return imgs, masks, missing
 
-image_paths = []
-mask_paths = []
+# -----------------------
+# Load splits and prepare data
+# -----------------------
+train_split_path = os.path.join(SPLIT_DIR, 'train_entries.json')
+val_split_path   = os.path.join(SPLIT_DIR, 'val_entries.json')
+test_split_path  = os.path.join(SPLIT_DIR, 'test_entries.json')
 
-for item in data:
-    try:
-        img_path = os.path.join(BASE_PATH, item['path'])
-        folder_num = int(item['path'].split('/')[0])
-        mask_filename = os.path.splitext(os.path.basename(item['path']))[0] + "_mask.npy"
-        mask_path = os.path.join(MASKS_PATH, f"folder_{folder_num:03d}", mask_filename)
+for p in (train_split_path, val_split_path, test_split_path):
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Split file not found: {p}")
 
-        if os.path.exists(img_path) and os.path.exists(mask_path):
-            image_paths.append(img_path)
-            mask_paths.append(mask_path)
-    except Exception as e:
-        print(f"Skipping invalid entry: {e}")
+with open(train_split_path, 'r', encoding='utf-8') as f:
+    train_entries = json.load(f)
+with open(val_split_path, 'r', encoding='utf-8') as f:
+    val_entries = json.load(f)
+with open(test_split_path, 'r', encoding='utf-8') as f:
+    test_entries = json.load(f)
 
-print(f"Found {len(image_paths)} valid pairs")
+train_imgs, train_masks, train_missing = build_paths_from_entries(train_entries)
+val_imgs, val_masks, val_missing = build_paths_from_entries(val_entries)
+test_imgs, test_masks, test_missing = build_paths_from_entries(test_entries)
 
-train_imgs, val_imgs, train_masks, val_masks = train_test_split(
-    image_paths, mask_paths, test_size=0.2, random_state=42
-)
+print("Train entries:", len(train_entries), "-> sheets with masks:", len(train_imgs), "missing:", len(train_missing))
+print("Val entries:", len(val_entries), "-> sheets with masks:", len(val_imgs), "missing:", len(val_missing))
+print("Test entries:", len(test_entries), "-> sheets with masks:", len(test_imgs), "missing:", len(test_missing))
 
-train_gen = DataGenerator(train_imgs, train_masks)
-val_gen = DataGenerator(val_imgs, val_masks)
+# Save missing report
+os.makedirs(SPLIT_DIR, exist_ok=True)
+with open(REPORT_CSV, 'w', newline='', encoding='utf-8') as csvf:
+    writer = csv.writer(csvf)
+    writer.writerow(['split','entry_path','img_exists','mask_exists'])
+    for e in train_missing:
+        writer.writerow(['train', e['path'], e['img_exists'], e['mask_exists']])
+    for e in val_missing:
+        writer.writerow(['val', e['path'], e['img_exists'], e['mask_exists']])
+    for e in test_missing:
+        writer.writerow(['test', e['path'], e['img_exists'], e['mask_exists']])
+print(f"[✔] Split/missing report saved to: {REPORT_CSV}")
 
-model = create_unet_model()
+total_missing = len(train_missing) + len(val_missing) + len(test_missing)
+if total_missing > 0:
+    print(f"Warning: {total_missing} entries missing image or mask files. Check {REPORT_CSV}.")
+    # By default we stop to avoid training on incomplete dataset.
+    raise RuntimeError("Missing image/mask files detected. Fix or remove entries before training.")
+
+# -----------------------
+# Generators
+# -----------------------
+train_gen = DataGenerator(train_imgs, train_masks, batch_size=BATCH_SIZE, target_size=TARGET_SIZE, shuffle=True)
+val_gen = DataGenerator(val_imgs, val_masks, batch_size=BATCH_SIZE, target_size=TARGET_SIZE, shuffle=False)
+test_gen = DataGenerator(test_imgs, test_masks, batch_size=BATCH_SIZE, target_size=TARGET_SIZE, shuffle=False)
+
+# -----------------------
+# Model, callbacks, training
+# -----------------------
+model = create_unet_model(input_size=(TARGET_SIZE[0], TARGET_SIZE[1], 3))
 model.summary()
 
+checkpoint_path = MODEL_PATH
 callbacks = [
-    ModelCheckpoint(MODEL_PATH, save_best_only=True, monitor='val_iou_metric', mode='max'),
-    EarlyStopping(patience=10, monitor='val_iou_metric', mode='max'),
-    ReduceLROnPlateau(factor=0.1, patience=5)
+    ModelCheckpoint(checkpoint_path, save_best_only=True, monitor='val_iou_metric', mode='max'),
+    EarlyStopping(patience=10, monitor='val_iou_metric', mode='max', restore_best_weights=True),
+    ReduceLROnPlateau(factor=0.1, patience=5, monitor='val_iou_metric', mode='max')
 ]
 
 history = model.fit(
     train_gen,
-    validation_data=val_gen,
     epochs=EPOCHS,
     steps_per_epoch=min(STEPS_PER_EPOCH, len(train_gen)),
+    validation_data=val_gen,
     validation_steps=min(VALIDATION_STEPS, len(val_gen)),
     callbacks=callbacks
 )
+
+# Save final model
+model.save(MODEL_PATH)
+print(f"[✔] Training finished. Model saved to: {MODEL_PATH}")
+
+# -----------------------
+# Evaluate on test set
+# -----------------------
+print("[*] Evaluating on test set...")
+eval_results = model.evaluate(test_gen, steps=min(len(test_gen), VALIDATION_STEPS), return_dict=True)
+print("Test evaluation results:")
+for k, v in eval_results.items():
+    print(f"  {k}: {v:.4f}")
+
+# optionally: save history plots
+try:
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10,4))
+    plt.plot(history.history.get('loss', []), label='train_loss')
+    plt.plot(history.history.get('val_loss', []), label='val_loss')
+    plt.legend(); plt.title('Loss')
+    plt.show()
+except Exception:
+    pass
+
 
